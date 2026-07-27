@@ -94,4 +94,4 @@ By using it you agree that:
 ## License
 
 Released under the [MIT License](LICENSE). Remember to put your name and year in
-the `LICENSE` file (it currently contains a `<YOUR NAME>` placeholder).
+the `LICENSE` file (it currently contains a MTi mti@mti.sk placeholder).

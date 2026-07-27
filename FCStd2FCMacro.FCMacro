@@ -1,0 +1,348 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+#  FCStd2FCMacro  -  export the active document's tree into a rebuild macro
+# -----------------------------------------------------------------------------
+#  Run this WITH A DOCUMENT OPEN. It walks the tree and writes a self-contained
+#  FreeCAD macro that recreates the model. It reads LIVE objects via the API
+#  (exact geometry, placements, parameters), so it cannot drift from the model.
+#
+#  Scope / limitations (by design):
+#   * Sketches are re-created with exact geometry and FIXED with a Block
+#     constraint (0 DOF, no dimensions). Un-block a sketch if you need to edit
+#     it dimensionally.
+#   * Dress-ups (Fillet, Chamfer, Draft, Thickness) are exported only as a
+#     COMMENT NOTE (radius/size + edge count). Their edges are addressed through
+#     topological-naming, which cannot be reliably replayed on a rebuilt shape.
+#     Re-apply them in the GUI as the final step.
+#   * Unknown object types are emitted as a TODO comment (never silently lost).
+#
+#  Output: <macro dir>/<DocName>_rebuild.FCMacro  (path is printed to the
+#  Report view: View -> Panels -> Report view).
+# =============================================================================
+import FreeCAD as App
+import os
+import traceback
+
+# ------------------------------- CONFIG --------------------------------------
+BLOCK_SKETCHES = True      # fully fix sketch geometry with Block constraints
+DRESSUP_AS_NOTE = True     # Fillet/Chamfer/Draft/Thickness -> comment only
+# -----------------------------------------------------------------------------
+
+# property groups emitted generically (only if the object has them)
+FEATURE_PROPS = ["Type", "SideType", "Length", "Length2", "Reversed",
+                 "Offset", "TaperAngle", "TaperAngle2", "Angle", "Angle2",
+                 "UseCustomVector", "Direction", "AlongSketchNormal"]
+HOLE_PROPS = ["Diameter", "ThreadType", "HoleCutType", "HoleCutDiameter",
+              "HoleCutDepth", "HoleCutCountersinkAngle", "DepthType", "Depth",
+              "Tapered", "Reversed"]
+PATTERN_PROPS = ["Length", "Angle", "Occurrences", "Reversed", "Mode",
+                 "Intervals", "TransformMode"]
+PRIMITIVE_PROPS = ["Length", "Width", "Height", "Radius", "Radius1", "Radius2",
+                   "Angle", "Angle1", "Angle2", "Angle3"]
+
+DRESSUPS = ("PartDesign::Fillet", "PartDesign::Chamfer",
+            "PartDesign::Draft", "PartDesign::Thickness")
+TRANSFORMS = ("PartDesign::Mirrored", "PartDesign::LinearPattern",
+              "PartDesign::PolarPattern", "PartDesign::MultiTransform")
+
+
+def outpath(doc):
+    try:
+        d = App.getUserMacroDir(True)
+        if d and os.path.isdir(d):
+            return os.path.join(d, "%s_rebuild.FCMacro" % doc.Name)
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser("~"), "%s_rebuild.FCMacro" % doc.Name)
+
+
+def fnum(v):
+    try:
+        return repr(float(v))
+    except Exception:
+        return "0.0"
+
+
+def py(v):
+    """Return a Python literal for a property value, or None if unsupported."""
+    if isinstance(v, bool):
+        return repr(v)
+    if isinstance(v, str):
+        return repr(v)
+    if isinstance(v, int):
+        return repr(v)
+    if isinstance(v, float):
+        return repr(v)
+    try:
+        from FreeCAD import Vector as _V
+        if isinstance(v, _V):
+            return "Vector(%r, %r, %r)" % (v.x, v.y, v.z)
+    except Exception:
+        pass
+    try:
+        return repr(float(v))          # FreeCAD quantities
+    except Exception:
+        return None
+
+
+def link_name(val):
+    """Name of a linked object from a Link / LinkSub / list property."""
+    if val is None:
+        return None
+    if isinstance(val, (tuple, list)):
+        if not val:
+            return None
+        first = val[0]
+        if isinstance(first, (tuple, list)) and first:
+            first = first[0]
+        return getattr(first, "Name", None)
+    return getattr(val, "Name", None)
+
+
+def is_constr(sk, i):
+    if hasattr(sk, "getConstruction"):
+        try:
+            return bool(sk.getConstruction(i))
+        except Exception:
+            pass
+    try:
+        return bool(sk.Geometry[i].Construction)
+    except Exception:
+        return False
+
+
+def geom_line(gm, con):
+    t = gm.TypeId
+    try:
+        if t == 'Part::GeomLineSegment':
+            s, e = gm.StartPoint, gm.EndPoint
+            return ('g.append(sk.addGeometry(Part.LineSegment('
+                    'Vector(%s,%s,0),Vector(%s,%s,0)),%r))'
+                    % (fnum(s.x), fnum(s.y), fnum(e.x), fnum(e.y), con))
+        if t == 'Part::GeomCircle':
+            c = gm.Center
+            return ('g.append(sk.addGeometry(Part.Circle('
+                    'Vector(%s,%s,0),Vector(0,0,1),%s),%r))'
+                    % (fnum(c.x), fnum(c.y), fnum(gm.Radius), con))
+        if t == 'Part::GeomArcOfCircle':
+            c = gm.Center
+            return ('g.append(sk.addGeometry(Part.ArcOfCircle('
+                    'Part.Circle(Vector(%s,%s,0),Vector(0,0,1),%s),%s,%s),%r))'
+                    % (fnum(c.x), fnum(c.y), fnum(gm.Radius),
+                       fnum(gm.FirstParameter), fnum(gm.LastParameter), con))
+        if t == 'Part::GeomPoint':
+            return ('g.append(sk.addGeometry(Part.Point('
+                    'Vector(%s,%s,0)),%r))' % (fnum(gm.X), fnum(gm.Y), con))
+        if t == 'Part::GeomEllipse':
+            c = gm.Center
+            return ('# TODO ellipse (orientation may be lost)\n'
+                    'g.append(sk.addGeometry(Part.Ellipse('
+                    'Vector(%s,%s,0),%s,%s),%r))'
+                    % (fnum(c.x), fnum(c.y), fnum(gm.MajorRadius),
+                       fnum(gm.MinorRadius), con))
+    except Exception as e:
+        return '# geometry export error (%s): %s' % (t, e)
+    return '# UNSUPPORTED geometry %s - add manually' % t
+
+
+def export_sketch(o, body_var):
+    L = ['O[%r] = %s.newObject("Sketcher::SketchObject", %r)'
+         % (o.Name, body_var, o.Name),
+         'sk = O[%r]' % o.Name,
+         'sk.MapMode = "Deactivated"']
+    b = o.Placement.Base
+    q = o.Placement.Rotation.Q
+    L.append('sk.Placement = App.Placement(Vector(%s,%s,%s), '
+             'App.Rotation(%s,%s,%s,%s))'
+             % (fnum(b.x), fnum(b.y), fnum(b.z),
+                fnum(q[0]), fnum(q[1]), fnum(q[2]), fnum(q[3])))
+    L.append('g = []')
+    for i, gm in enumerate(o.Geometry):
+        L.append(geom_line(gm, is_constr(o, i)))
+    if BLOCK_SKETCHES:
+        L += ['try:',
+              '    sk.addConstraint([Sketcher.Constraint("Block", i) '
+              'for i in g if not sk.getConstruction(i)])',
+              'except Exception as _e:',
+              '    App.Console.PrintWarning("Block %s: %%s\\n" %% _e)' % o.Name]
+    L += ['sk.Visibility = False', 'doc.recompute()']
+    return L
+
+
+def emit_props(o, props):
+    L = []
+    for p in props:
+        if hasattr(o, p):
+            try:
+                lit = py(getattr(o, p))
+            except Exception:
+                lit = None
+            if lit is not None:
+                L.append('try:\n    _f.%s = %s\nexcept Exception:\n    pass'
+                         % (p, lit))
+    return L
+
+
+# ---------------------------------------------------------------------------
+def run():
+    doc = App.ActiveDocument
+    if doc is None:
+        raise Exception("No active document.")
+    OUT = outpath(doc)
+    App.Console.PrintMessage("=== FCStd2FCMacro: target = %s ===\n" % OUT)
+
+    L = ['# -*- coding: utf-8 -*-',
+         '# Rebuild of "%s" - generated by FCStd2FCMacro' % doc.Name,
+         'import FreeCAD as App',
+         'from FreeCAD import Vector',
+         'import Part, Sketcher',
+         'doc = App.newDocument("%s_rebuild")' % doc.Name,
+         'O = {}          # original name -> recreated object',
+         '_body = None',
+         'doc.recompute()', '']
+    notes, errors = [], []
+
+    skip_types = ("App::Origin", "App::Plane", "App::Line", "App::Point",
+                  "PartDesign::Plane", "PartDesign::Line", "PartDesign::Point",
+                  "PartDesign::CoordinateSystem")
+    skip_names = ("X_Axis", "Y_Axis", "Z_Axis", "XY_Plane", "XZ_Plane",
+                  "YZ_Plane", "Origin")
+    cur_body_var = "doc"      # where non-body objects go
+
+    for o in doc.Objects:
+        if o.isDerivedFrom("App::Origin"):
+            continue
+        if o.TypeId in skip_types or o.Name.startswith(skip_names):
+            continue
+        try:
+            t = o.TypeId
+
+            if t == 'PartDesign::Body':
+                L.append('O[%r] = doc.addObject("PartDesign::Body", %r)'
+                         % (o.Name, o.Name))
+                L.append('_body = O[%r]' % o.Name)
+                L.append('doc.recompute()')
+                L.append('')
+                cur_body_var = "_body"
+
+            elif t == 'Sketcher::SketchObject':
+                L.append('# --- sketch %s ---' % o.Name)
+                L += export_sketch(o, cur_body_var)
+                L.append('')
+
+            elif hasattr(o, 'String') and hasattr(o, 'FontFile'):   # ShapeString
+                b = o.Placement.Base; q = o.Placement.Rotation.Q
+                L += ['import Draft',
+                      '_mk = getattr(Draft,"make_shapestring",None) or Draft.makeShapeString',
+                      'O[%r] = _mk(String=%r, FontFile=%r, Size=%s)'
+                      % (o.Name, o.String, o.FontFile, fnum(o.Size)),
+                      'doc.recompute()',
+                      'O[%r].Placement = App.Placement(Vector(%s,%s,%s),'
+                      'App.Rotation(%s,%s,%s,%s))'
+                      % (o.Name, fnum(b.x), fnum(b.y), fnum(b.z),
+                         fnum(q[0]), fnum(q[1]), fnum(q[2]), fnum(q[3])),
+                      'doc.recompute()',
+                      'try:\n    _body.addObject(O[%r])\nexcept Exception:\n    pass'
+                      % o.Name,
+                      'sk = O[%r]' % o.Name, '']
+
+            elif t == 'PartDesign::Hole':
+                L.append('_f = %s.newObject("PartDesign::Hole", %r)'
+                         % (cur_body_var, o.Name))
+                prof = link_name(getattr(o, 'Profile', None))
+                if prof:
+                    L.append('_f.Profile = O[%r]' % prof)
+                L += emit_props(o, HOLE_PROPS)
+                L.append('O[%r] = _f' % o.Name)
+                L.append('doc.recompute()')
+                L.append('')
+
+            elif t in DRESSUPS and DRESSUP_AS_NOTE:
+                r = getattr(o, "Radius", getattr(o, "Size", "?"))
+                try:
+                    ne = len(o.Base[1])
+                except Exception:
+                    ne = 0
+                notes.append("%s '%s'  value=%s  on %d edges"
+                             % (t.split('::')[-1], o.Name, r, ne))
+                L.append('# GUI DRESS-UP: %s %s value=%s on %d edges'
+                         % (t.split('::')[-1], o.Name, r, ne))
+                L.append('')
+
+            elif t in TRANSFORMS:
+                L.append('_f = %s.newObject(%r, %r)'
+                         % (cur_body_var, t, o.Name))
+                try:
+                    origs = [link_name(x) for x in (o.Originals or [])]
+                    origs = [x for x in origs if x]
+                    if origs:
+                        L.append('_f.Originals = [%s]'
+                                 % ", ".join("O[%r]" % x for x in origs))
+                except Exception:
+                    pass
+                L += emit_props(o, PATTERN_PROPS)
+                L.append('# NOTE: pattern Direction/Axis may need manual setup')
+                L.append('O[%r] = _f' % o.Name)
+                L.append('doc.recompute()')
+                L.append('')
+
+            elif hasattr(o, 'Profile') and t.startswith('PartDesign::'):
+                # additive/subtractive profile feature (Pad, Pocket, Revolution,
+                # Groove, Loft, Pipe, ...) - generic
+                L.append('_f = %s.newObject(%r, %r)'
+                         % (cur_body_var, t, o.Name))
+                prof = link_name(o.Profile)
+                if prof:
+                    L.append('_f.Profile = O[%r]' % prof)
+                L += emit_props(o, FEATURE_PROPS)
+                L.append('try:\n    _f.Refine = False\nexcept Exception:\n    pass')
+                L.append('O[%r] = _f' % o.Name)
+                L.append('doc.recompute()')
+                L.append('')
+
+            elif t.startswith('Part::') and hasattr(o, 'Shape'):
+                # Part workbench primitive (Box, Cylinder, ...)
+                L.append('_f = doc.addObject(%r, %r)' % (t, o.Name))
+                L += emit_props(o, PRIMITIVE_PROPS)
+                b = o.Placement.Base; q = o.Placement.Rotation.Q
+                L.append('_f.Placement = App.Placement(Vector(%s,%s,%s),'
+                         'App.Rotation(%s,%s,%s,%s))'
+                         % (fnum(b.x), fnum(b.y), fnum(b.z),
+                            fnum(q[0]), fnum(q[1]), fnum(q[2]), fnum(q[3])))
+                L.append('O[%r] = _f' % o.Name)
+                L.append('doc.recompute()')
+                L.append('')
+
+            else:
+                L.append('# TODO unsupported object %r (%s) - add manually'
+                         % (o.Name, t))
+                notes.append("UNSUPPORTED %s (%s)" % (o.Name, t))
+
+        except Exception as e:
+            errors.append("%s: %s" % (o.Name, e))
+            L.append('# ERROR at %s: %s' % (o.Name, e))
+
+    L += ['doc.recompute()',
+          'App.Console.PrintMessage("Rebuild done. Re-apply dress-ups in GUI:\\n")']
+    for n in notes:
+        L.append('App.Console.PrintMessage("  - %s\\n")' % n)
+    L += ['try:\n    import FreeCADGui as Gui\n'
+          '    Gui.ActiveDocument.ActiveView.fitAll()\nexcept Exception:\n    pass']
+
+    with open(OUT, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(L))
+    App.Console.PrintMessage("=== SAVED: %s  (%d lines) ===\n" % (OUT, len(L)))
+    if errors:
+        App.Console.PrintWarning("Object errors:\n")
+        for e in errors:
+            App.Console.PrintWarning("  - %s\n" % e)
+    if notes:
+        App.Console.PrintMessage("Notes / manual steps:\n")
+        for n in notes:
+            App.Console.PrintMessage("  - %s\n" % n)
+
+
+try:
+    run()
+except Exception:
+    App.Console.PrintError("FCStd2FCMacro failed:\n%s\n" % traceback.format_exc())
